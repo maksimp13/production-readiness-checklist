@@ -4,7 +4,7 @@
 
 A practical readiness checklist for services running on Kubernetes and cloud infrastructure generally.
 
-73 checks, assembled from what actually breaks — not from vendor documentation.
+74 checks, assembled from what actually breaks — not from vendor documentation.
 
 ## How to read it
 
@@ -12,10 +12,10 @@ Every item carries one of two marks:
 
 | | Meaning |
 |---|---|
-| 🤖 | An automated scanner catches this — `popeye`, `polaris`, `kube-score`, `trivy`, `goldilocks`. Run them before you read any further. It is free and takes half an hour. |
+| 🤖 | An automated scanner catches this — `popeye`, `polaris`, `kube-score`, `trivy`. Run them before you read any further. It is free and takes half an hour. (`goldilocks` is not that kind of tool: it reports VPA right-sizing recommendations and is used for one item below.) |
 | 👤 | No scanner sees this. It needs knowledge of the system, its incident history, or verification by doing. |
 
-**53 of the 73 items are marked 👤.** That is not padding. Tools are good at finding *missing configuration* and bad at finding *wrong configuration*, because "correct" depends on what the system does and what an outage costs.
+**59 of the 74 items are marked 👤.** That is not padding. Tools are good at finding *missing configuration* and bad at finding *wrong configuration*, because "correct" depends on what the system does and what an outage costs.
 
 Here is the difference in one example. A scanner will confirm you have a readiness probe. It will not notice that the probe returns `200 OK` whether or not the database is reachable — and therefore guarantees nothing at all.
 
@@ -31,29 +31,30 @@ The items where your answer is "probably, yes" are the findings. A confident no 
 
 ## 1. Failure behaviour
 
-- [ ] 🤖 Every workload has liveness, readiness and — where startup is slow — startup probes configured
-- [ ] 👤 **Readiness genuinely reflects readiness** — it checks the critical dependencies rather than always returning `200`. The most common false guarantee in a cluster
+- [ ] 🤖 Every workload has a readiness probe, and a startup probe where startup is slow
+- [ ] 👤 **Readiness answers only "can this instance serve right now"** — local state, warmed caches, not shutting down. It must NOT check shared dependencies: a probe that pings the database marks every replica NotReady at the same instant and turns a slow database into `connection refused`. A probe that always returns `200` regardless of anything is the opposite failure and just as common
+- [ ] 👤 A liveness probe exists only where the process can genuinely wedge unrecoverably — it is not a default, and a needless one turns a blip into a restart loop
 - [ ] 👤 **Liveness does NOT check external dependencies.** Otherwise an unreachable database restarts every pod at once and turns degradation into a total outage
 - [ ] 👤 Slow-starting applications have a startup probe separate from liveness — without it, a cold start becomes a restart loop
 - [ ] 🤖 Critical workloads have a PodDisruptionBudget
-- [ ] 👤 The PDB does not block drains forever (`minAvailable` equal to the replica count means the node never drains and the cluster never upgrades)
+- [ ] 👤 The PDB still permits voluntary disruption. `disruptionsAllowed` hits zero whenever healthy pods drop to `minAvailable`, so `minAvailable: 3` with three replicas never drains — and `minAvailable: 2` with three stops draining the moment one pod is already unhealthy. Managed node upgrades and the autoscaler time out and terminate anyway, so the real damage is a graceful upgrade silently becoming an ungraceful one
 - [ ] 🤖 Stateless services run more than one replica
 - [ ] 🤖 `podAntiAffinity` or `topologySpreadConstraints` are set — replicas do not share a node
 - [ ] 👤 **The dependency graph has been walked: what exactly breaks when one node is lost, and when a zone is lost.** Not "it should survive" but which services degrade, by name
 - [ ] 👤 Single points of failure outside the cluster have been found — a lone database, one NAT gateway, Redis without a replica, a single queue instance
 - [ ] 👤 `terminationGracePeriodSeconds` matches how long requests actually take to finish, and the application handles `SIGTERM`
-- [ ] 👤 Pods leave the load balancer **before** the process stops (`preStop` hook) — otherwise every deploy drops a share of requests
+- [ ] 👤 The pod keeps serving until deregistration has propagated (`preStop` sleep). Endpoint removal and `SIGTERM` are dispatched in parallel, not in sequence — the hook does not pull the pod out of rotation, it delays shutdown so the removal has time to reach kube-proxy and the load balancer
 - [ ] 👤 Timeouts and retries use exponential backoff **and jitter**. Retries without jitter synchronise themselves into a storm
 - [ ] 🤖 No `latest` tag and no floating tags in production
 
 ## 2. Resources and load
 
-- [ ] 🤖 `requests` and `limits` are set on every container
+- [ ] 🤖 `requests` are set on every container, and memory `limits` too (CPU limits are a separate judgement — see below)
 - [ ] 👤 **`requests` are based on measured consumption, not copied from a neighbouring manifest.** Cross-check against VPA recommendations or `goldilocks`
 - [ ] 👤 The decision on CPU limits was made deliberately. CPU throttling under limits is a routine and nearly invisible cause of latency growth
 - [ ] 🤖 Every container has a memory limit: one pod's OOM must not take the node with it
 - [ ] 👤 Critical services are QoS class Guaranteed or Burstable, never BestEffort — those are evicted first
-- [ ] 🤖 HPA is configured wherever load varies
+- [ ] 👤 HPA is configured wherever load varies — no scanner can judge "wherever load varies", and none flags a workload for lacking an HPA at all
 - [ ] 👤 The HPA metric reflects real saturation. CPU lies on I/O-bound workloads
 - [ ] 👤 The cluster autoscaler is fast enough: node start plus image pull is shorter than the degradation you can tolerate
 - [ ] 👤 **There is headroom for losing a zone.** Three zones at 90% utilisation give you an outage on zone loss, not degradation
@@ -62,13 +63,13 @@ The items where your answer is "probably, yes" are the findings. A confident no 
 
 ## 3. Data and recovery
 
-- [ ] 🤖 Backups are configured (Velero, disk snapshots, database dumps)
+- [ ] 👤 Backups are configured (Velero, disk snapshots, database dumps)
 - [ ] 👤 **A backup has been restored at least once.** Not "is it configured" but "have you done it". In most reviews the answer is no
 - [ ] 👤 **The actual RPO and RTO are known** — measured in a drill, not written in a document
 - [ ] 👤 Backups live outside the same account and region: "the account was deleted" and "ransomware" are not covered by a snapshot sitting next door
 - [ ] 👤 Backups are encrypted, and access to them is granted separately from access to production
 - [ ] 👤 Backup integrity is verified automatically, not at the moment the backup is needed
-- [ ] 🤖 PersistentVolumes holding valuable data do not have `reclaimPolicy: Delete`
+- [ ] 👤 PersistentVolumes holding valuable data do not have `reclaimPolicy: Delete` — and for dynamically provisioned volumes the knob is on the StorageClass, where most cloud defaults are `Delete`
 - [ ] 👤 For StatefulSets it is clear what happens when a volume is lost, and whether the application replicates at its own level
 - [ ] 👤 Database migrations are reversible, or at least compatible with the previous application version — otherwise rollback is impossible
 - [ ] 👤 A disaster recovery plan exists and somebody other than its author knows about it
@@ -82,21 +83,21 @@ The items where your answer is "probably, yes" are the findings. A confident no 
 - [ ] 👤 Policies are built from default-deny rather than as a set of point permissions on top of an open network
 - [ ] 🤖 No `cluster-admin` on application service accounts in RBAC
 - [ ] 👤 **It is known which humans have production access and how that access is revoked when they leave**
-- [ ] 🤖 No secrets in git — the whole history has been checked, not just the current state
+- [ ] 👤 No secrets in git — the **whole history**, not just the current tree. Image and filesystem scanners read the checked-out working tree; history needs gitleaks, trufflehog or git-secrets
 - [ ] 👤 Secrets are encrypted in etcd; an external manager is in use (External Secrets, SOPS, Vault)
 - [ ] 👤 Secret rotation is technically possible and has been performed at least once
 - [ ] 🤖 Images are scanned for vulnerabilities, and there is a process for reacting to a finding rather than only a report
-- [ ] 👤 `automountServiceAccountToken` is disabled where the token is not needed
+- [ ] 🤖 `automountServiceAccountToken` is disabled where the token is not needed
 - [ ] 👤 A policy engine is in place (Kyverno, Gatekeeper) — or the rules exist only in people's heads and in review
 
 ## 5. Observability
 
-- [ ] 🤖 Metrics are collected from every workload, infrastructure included
+- [ ] 👤 Metrics are collected from every workload, infrastructure included — scanners report whether metrics-server exists, not whether anything is actually scraped
 - [ ] 👤 **The exact list of alerts that wake a human at night is known.** Without that list there is no on-call, only hope
 - [ ] 👤 **The false positive rate has been measured.** An on-call engineer who has learned to ignore alerts is not observability, it is noise with a salary
 - [ ] 👤 Alerts fire on symptoms ("users are getting errors") and not only on causes ("CPU is high")
 - [ ] 👤 SLOs exist, along with an alert on error budget burn rate
-- [ ] 🤖 Logs are centralised, retention is set, search works
+- [ ] 👤 Logs are centralised, retention is set, search works
 - [ ] 👤 One incident can be traced end to end: logs, metrics and traces share a correlation identifier
 - [ ] 👤 A dashboard exists that answers "what exactly is broken" within five minutes, and people actually use it
 - [ ] 👤 Alerts exist for approaching limits: disk, cloud quotas, API rate limits, **TLS certificate expiry**
@@ -140,7 +141,9 @@ Go through the checks and mark each one "verified by doing" rather than "configu
 
 ### Which production readiness checks can be automated?
 
-Roughly a quarter. Scanners such as popeye, polaris, kube-score, trivy and goldilocks reliably catch missing probes, absent resource limits, privileged containers, missing NetworkPolicies, `latest` tags and over-broad RBAC. On this list that is 20 items out of 73. Run them first — it is free.
+About a fifth. Scanners such as popeye, polaris, kube-score and trivy reliably catch missing probes, absent resource limits, privileged containers, missing NetworkPolicies, `latest` tags, over-broad RBAC and auto-mounted service account tokens. On this list that is 15 items out of 74. Run them first — it is free.
+
+Be careful with the boundary. Backups, log centralisation, metric coverage and "is there an HPA where load varies" all *sound* like YAML questions, and none of them is one: a scanner cannot see whether anything is actually scraped, whether a backup exists, or whether load varies.
 
 ### Why isn't running a scanner enough?
 
